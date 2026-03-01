@@ -90,6 +90,21 @@ def extract_embeddings(image_path: str):
 
 
 # ─────────────────────────────────────────
+# STEP 3b — Crop Face Thumbnail
+# ─────────────────────────────────────────
+def crop_face_thumbnail(image_path: str, facial_area: dict, size: int = 160) -> bytes:
+    """Crop the face region from image, resize to square, return JPEG bytes."""
+    img = cv2.imread(image_path)
+    x, y, w, h = facial_area["x"], facial_area["y"], facial_area["w"], facial_area["h"]
+    x, y = max(0, x), max(0, y)
+    x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
+    face_crop = img[y:y2, x:x2]
+    face_crop = cv2.resize(face_crop, (size, size))
+    _, buf = cv2.imencode(".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return buf.tobytes()
+
+
+# ─────────────────────────────────────────
 # STEP 4 — Match Faces
 # ─────────────────────────────────────────
 def cosine_similarity(a, b):

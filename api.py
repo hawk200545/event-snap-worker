@@ -1,12 +1,15 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 import tempfile
 import os
 import uuid
 from dotenv import load_dotenv
 from detector import process_image, match_faces
 from prisma import Prisma
+from bullmq import Worker
+from consumer import process_photo_job
 import redis
 
 # Load environment variables from .env before using them
@@ -27,7 +30,24 @@ db = Prisma()
 async def lifespan(app: FastAPI):
     await db.connect()
     print("✅ Connected to NeonDB!")
+
+    parsed = urlparse(REDIS_URL) if REDIS_URL else None
+    worker = None
+    if parsed:
+        redis_opts = {
+            "host": parsed.hostname,
+            "port": parsed.port or 6379,
+            "username": parsed.username or "default",
+            "password": parsed.password,
+            "tls": REDIS_URL.startswith("rediss://"),
+        }
+        worker = Worker("photo-processing", process_photo_job, {"connection": redis_opts})
+        print("✅ BullMQ Worker started — listening on 'photo-processing'")
+
     yield
+
+    if worker:
+        await worker.close()
     await db.disconnect()
 
 app = FastAPI(lifespan=lifespan)
@@ -60,7 +80,26 @@ def health_check():
     return {"status": "EventSnap ML API is running! 🚀"}
 
 # ─────────────────────────────────────────
-# ROUTE 2 — Create Room
+# ROUTE 2 — Extract Embedding (called by NestJS faces.service.ts selfieMatch)
+# ─────────────────────────────────────────
+@app.post("/extract-embedding")
+async def extract_embedding(image: UploadFile = File(...)):
+    file_bytes = await image.read()
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+    try:
+        embeddings = process_image(tmp_path)
+    finally:
+        os.unlink(tmp_path)
+
+    if not embeddings:
+        raise HTTPException(status_code=422, detail="No face detected in the image")
+
+    return {"embedding": embeddings[0]["embedding"]}
+
+# ─────────────────────────────────────────
+# ROUTE 3 — Create Room
 # ─────────────────────────────────────────
 @app.post("/room/create")
 async def create_room(name: str):
@@ -93,7 +132,7 @@ async def create_room(name: str):
         "name": room.name
     }
 # ─────────────────────────────────────────
-# ROUTE 3 — Upload Photo
+# ROUTE 4 — Upload Photo
 # ─────────────────────────────────────────
 @app.post("/room/{room_id}/upload")
 async def upload_photo(room_id: str, file: UploadFile = File(...)):
@@ -153,7 +192,7 @@ async def upload_photo(room_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────
-# ROUTE 4 — Search by Selfie
+# ROUTE 5 — Search by Selfie
 # ─────────────────────────────────────────
 @app.post("/room/{room_id}/search")
 async def search_by_selfie(room_id: str, file: UploadFile = File(...)):
@@ -278,7 +317,7 @@ async def get_pending_requests(room_id: str):
         "pending": pending
     }
 # ─────────────────────────────────────────
-# ROUTE 5 — Room Status
+# ROUTE 6 — Room Status
 # ─────────────────────────────────────────
 @app.get("/room/{room_id}/status")
 async def room_status(room_id: str):
