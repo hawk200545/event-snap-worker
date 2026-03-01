@@ -1,0 +1,148 @@
+generator client {
+  provider             = "prisma-client-py"
+  interface            = "asyncio"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ORGANIZER
+  ADMIN
+}
+
+enum RoomStatus {
+  DRAFT
+  ACTIVE
+  EXPIRED
+  DELETED
+}
+
+enum UploadPermission {
+  PUBLIC
+  APPROVAL_REQUIRED
+}
+
+enum GuestSessionStatus {
+  ACTIVE
+  LEFT
+  BLOCKED
+}
+
+enum PhotoStatus {
+  UPLOADED
+  PROCESSING
+  READY
+  PENDING_APPROVAL
+  REJECTED
+  DELETED
+  FAILED
+}
+
+enum PhotoSource {
+  GUEST_UPLOAD
+  ORGANIZER_UPLOAD
+  SELFIE_UPLOAD
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  fullName     String?
+  role         UserRole @default(ORGANIZER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  rooms Room[]
+
+  @@index([createdAt])
+}
+
+model Room {
+  id                     String           @id @default(uuid())
+  code                   String           @unique
+  organizerId            String
+  name                   String
+  startsAt               DateTime
+  endsAt                 DateTime
+  retentionDays          Int              @default(7)
+  uploadPermission       UploadPermission @default(PUBLIC)
+  faceRecognitionEnabled Boolean          @default(true)
+  status                 RoomStatus       @default(DRAFT)
+  createdAt              DateTime         @default(now())
+  updatedAt              DateTime         @updatedAt
+
+  organizer     User           @relation(fields: [organizerId], references: [id], onDelete: Cascade)
+  guestSessions GuestSession[]
+  photos        Photo[]
+
+  @@index([organizerId, createdAt])
+  @@index([status, endsAt])
+}
+
+model GuestSession {
+  id         String             @id @default(uuid())
+  roomId      String
+  guestToken  String             @unique
+  displayName String?
+  status      GuestSessionStatus @default(ACTIVE)
+  joinedAt    DateTime           @default(now())
+  leftAt      DateTime?
+
+  room   Room    @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  photos Photo[]
+
+  @@index([roomId, status])
+}
+
+model Photo {
+  id                String      @id @default(uuid())
+  roomId            String
+  uploaderSessionId String?
+  uploadedByUserId  String?
+  source            PhotoSource @default(GUEST_UPLOAD)
+
+  storageKey       String  @unique
+  bucket           String
+  originalFileName String?
+  contentType      String
+  extension        String?
+  sizeBytes        BigInt
+  width            Int?
+  height           Int?
+  uploadedAt       DateTime @default(now())
+
+  status           PhotoStatus @default(UPLOADED)
+  processingJobId  String?
+  processingError  String?
+  processedAt      DateTime?
+
+  thumbnailKey     String?
+  previewKey       String?
+
+  room            Room          @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  uploaderSession GuestSession? @relation(fields: [uploaderSessionId], references: [id], onDelete: SetNull)
+  faceEmbeddings  FaceEmbedding[]
+
+  @@index([roomId, uploadedAt])
+  @@index([roomId, status, uploadedAt])
+  @@index([processingJobId])
+}
+
+model FaceEmbedding {
+  id           String   @id @default(uuid())
+  photoId      String
+  roomId       String
+  faceIndex    Int      @default(0)
+  embedding    Float[]
+  faceThumbKey String?
+  createdAt    DateTime @default(now())
+
+  photo Photo @relation(fields: [photoId], references: [id], onDelete: Cascade)
+
+  @@index([roomId])
+  @@index([photoId])
+}

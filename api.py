@@ -1,13 +1,37 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import tempfile
 import os
-import json
-from detector import process_image, match_faces, cosine_similarity
+import uuid
+from dotenv import load_dotenv
+from detector import process_image, match_faces
+from prisma import Prisma
+import redis
 
-app = FastAPI()
+# Load environment variables from .env before using them
+load_dotenv()
 
-# Allow frontend to call this API
+# Initialize Redis connection safely — fall back to local Redis if REDIS_URL missing
+REDIS_URL = os.getenv("REDIS_URL")
+if REDIS_URL:
+    r = redis.from_url(REDIS_URL)
+else:
+    print("⚠️ REDIS_URL not set. Falling back to local Redis at redis://localhost:6379")
+    r = redis.Redis(host="localhost", port=6379, db=0)
+
+# Initialize Prisma
+db = Prisma()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db.connect()
+    print("✅ Connected to NeonDB!")
+    yield
+    await db.disconnect()
+
+app = FastAPI(lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,12 +39,18 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# ─────────────────────────────────────────
-# Temporary in-memory storage
-# (will replace with PostgreSQL later)
-# ─────────────────────────────────────────
-rooms = {}  # room_id → list of embeddings
+# Local uploads folder
+UPLOADS_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 
+def save_file_locally(file_bytes: bytes, filename: str) -> str:
+    """Save file locally and return path"""
+    ext = os.path.splitext(filename)[1] or ".jpg"
+    key = f"{uuid.uuid4().hex}{ext}"
+    path = os.path.join(UPLOADS_DIR, key)
+    with open(path, "wb") as f:
+        f.write(file_bytes)
+    return path, key
 
 # ─────────────────────────────────────────
 # ROUTE 1 — Health Check
@@ -29,91 +59,108 @@ rooms = {}  # room_id → list of embeddings
 def health_check():
     return {"status": "EventSnap ML API is running! 🚀"}
 
-
 # ─────────────────────────────────────────
-# ROUTE 2 — Upload Photo to Room
+# ROUTE 2 — Create Room
+# ─────────────────────────────────────────
+@app.post("/room/create")
+async def create_room(name: str):
+    # Create a default organizer user if not exists
+    user = await db.user.find_first()
+    
+    if not user:
+        user = await db.user.create(
+            data={
+                "email": "organizer@eventsnap.com",
+                "passwordHash": "hackathon123",
+                "fullName": "Event Organizer",
+                "role": "ORGANIZER"
+            }
+        )
+    
+    room = await db.room.create(
+        data={
+            "name": name,
+            "code": str(uuid.uuid4())[:8].upper(),
+            "organizerId": user.id,
+            "startsAt": "2026-03-01T00:00:00Z",
+            "endsAt": "2026-03-02T00:00:00Z",
+        }
+    )
+    return {
+        "success": True,
+        "room_id": room.id,
+        "room_code": room.code,
+        "name": room.name
+    }
+# ─────────────────────────────────────────
+# ROUTE 3 — Upload Photo
 # ─────────────────────────────────────────
 @app.post("/room/{room_id}/upload")
 async def upload_photo(room_id: str, file: UploadFile = File(...)):
-    """
-    Guest uploads a photo to the room
-    Extract faces and store embeddings
-    """
     try:
-        # Read file bytes
         file_bytes = await file.read()
         
+        # Save file locally
+        file_path, storage_key = save_file_locally(file_bytes, file.filename)
+        print(f"✅ Saved locally: {file_path}")
+        
         # Save to temp file for DeepFace
-        with tempfile.NamedTemporaryFile(
-            suffix=".jpg",
-            delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
         
-        # Process image
+        # Extract embeddings
         embeddings = process_image(tmp_path)
-        
-        # Cleanup temp file
         os.unlink(tmp_path)
         
         if not embeddings:
-            return {
-                "success": False,
-                "message": "No faces found in photo"
+            return {"success": False, "message": "No faces found"}
+        
+        # Save photo to NeonDB ← REAL DB NOW
+        photo = await db.photo.create(
+            data={
+                "roomId": room_id,
+                "storageKey": storage_key,
+                "bucket": "local",
+                "originalFileName": file.filename,
+                "contentType": "image/jpeg",
+                "sizeBytes": len(file_bytes),
+                "status": "READY"
             }
+        )
+        print(f"✅ Photo saved to NeonDB: {photo.id}")
         
-        # Store embeddings in memory (keyed by room)
-        if room_id not in rooms:
-            rooms[room_id] = []
-        
-        photo_id = f"{room_id}_{file.filename}"
-        
-        for emb in embeddings:
-            rooms[room_id].append({
-                "photo_id": photo_id,
-                "s3_url": f"placeholder/{photo_id}",  # will be real S3 URL later
-                "embedding": emb["embedding"]
-            })
-        
-        print(f"Room {room_id} now has {len(rooms[room_id])} embeddings")
+        # Save embeddings to NeonDB ← REAL DB NOW
+        for i, emb in enumerate(embeddings):
+            await db.faceembedding.create(
+                data={
+                    "photoId": photo.id,
+                    "roomId": room_id,
+                    "embedding": emb["embedding"],
+                    "faceIndex": i
+                }
+            )
+        print(f"✅ {len(embeddings)} embeddings saved to NeonDB")
         
         return {
             "success": True,
-            "photo_id": photo_id,
-            "faces_found": len(embeddings),
-            "message": f"Successfully processed {len(embeddings)} face(s)"
+            "photo_id": photo.id,
+            "file_path": file_path,
+            "faces_found": len(embeddings)
         }
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # ─────────────────────────────────────────
-# ROUTE 3 — Search by Selfie
+# ROUTE 4 — Search by Selfie
 # ─────────────────────────────────────────
 @app.post("/room/{room_id}/search")
 async def search_by_selfie(room_id: str, file: UploadFile = File(...)):
-    """
-    Guest uploads selfie
-    Returns all matching photos from the room
-    """
     try:
-        # Check room exists
-        if room_id not in rooms or not rooms[room_id]:
-            return {
-                "success": False,
-                "message": "Room not found or no photos uploaded yet"
-            }
-        
-        # Read selfie bytes
         file_bytes = await file.read()
         
-        # Save to temp file
-        with tempfile.NamedTemporaryFile(
-            suffix=".jpg",
-            delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
         
@@ -122,19 +169,31 @@ async def search_by_selfie(room_id: str, file: UploadFile = File(...)):
         os.unlink(tmp_path)
         
         if not selfie_embeddings:
-            return {
-                "success": False,
-                "message": "No face found in selfie"
-            }
+            return {"success": False, "message": "No face found in selfie"}
         
         selfie_embedding = selfie_embeddings[0]["embedding"]
         
-        # Match against room embeddings
-        matches = match_faces(
-            selfie_embedding,
-            rooms[room_id],
-            threshold=0.75
+        # Fetch all embeddings from NeonDB ← REAL DB NOW
+        db_embeddings = await db.faceembedding.find_many(
+            where={"roomId": room_id},
+            include={"photo": True}
         )
+        
+        if not db_embeddings:
+            return {"success": False, "message": "No photos in this room yet"}
+        
+        # Format for match_faces
+        stored_embeddings = [
+            {
+                "photo_id": emb.photoId,
+                "s3_url": emb.photo.storageKey,
+                "embedding": emb.embedding
+            }
+            for emb in db_embeddings
+        ]
+        
+        # Match faces
+        matches = match_faces(selfie_embedding, stored_embeddings, threshold=0.75)
         
         return {
             "success": True,
@@ -146,27 +205,91 @@ async def search_by_selfie(room_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─────────────────────────────────────────
-# ROUTE 4 — Check Room Status
-# ─────────────────────────────────────────
-@app.get("/room/{room_id}/status")
-def room_status(room_id: str):
-    """
-    Check how many photos are in a room
-    """
-    if room_id not in rooms:
-        return {
-            "room_id": room_id,
-            "exists": False,
-            "total_embeddings": 0
+# Guest requests access
+@app.post("/room/{room_id}/request")
+async def request_access(room_id: str, name: str, phone: str):
+    room = await db.room.find_unique(where={"id": room_id})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    
+    # Create guest session in NeonDB
+    guest = await db.guestsession.create(
+        data={
+            "roomId": room_id,
+            "guestToken": str(uuid.uuid4()),
+            "displayName": name,
+            "status": "ACTIVE"
         }
+    )
+    
+    # Set pending in Redis
+    r.set(f"participant:{guest.id}", "pending", ex=3600)
     
     return {
-        "room_id": room_id,
-        "exists": True,
-        "total_embeddings": len(rooms[room_id])
+        "success": True,
+        "participant_id": guest.id,
+        "status": "pending",
+        "message": "Waiting for organizer approval"
     }
 
+# Guest polls this every 3 seconds
+@app.get("/participant/{participant_id}/status")
+async def check_status(participant_id: str):
+    status = r.get(f"participant:{participant_id}")
+    return {
+        "participant_id": participant_id,
+        "status": status.decode() if status else "pending"
+    }
+
+# Organizer approves
+@app.post("/participant/{participant_id}/approve")
+async def approve_participant(participant_id: str):
+    r.set(f"participant:{participant_id}", "approved", ex=3600)
+    return {"success": True, "status": "approved"}
+
+# Organizer rejects
+@app.post("/participant/{participant_id}/reject")
+async def reject_participant(participant_id: str):
+    r.set(f"participant:{participant_id}", "rejected", ex=3600)
+    return {"success": True, "status": "rejected"}
+
+# Organizer sees all pending requests
+@app.get("/room/{room_id}/requests")
+async def get_pending_requests(room_id: str):
+    guests = await db.guestsession.find_many(
+        where={
+            "roomId": room_id,
+            "status": "ACTIVE"
+        }
+    )
+    
+    pending = []
+    for guest in guests:
+        status = r.get(f"participant:{guest.id}")
+        if not status or status.decode() == "pending":
+            pending.append({
+                "participant_id": guest.id,
+                "name": guest.displayName,
+                "joined_at": guest.joinedAt
+            })
+    
+    return {
+        "success": True,
+        "pending": pending
+    }
+# ─────────────────────────────────────────
+# ROUTE 5 — Room Status
+# ─────────────────────────────────────────
+@app.get("/room/{room_id}/status")
+async def room_status(room_id: str):
+    count = await db.faceembedding.count(
+        where={"roomId": room_id}
+    )
+    return {
+        "room_id": room_id,
+        "exists": count > 0,
+        "total_embeddings": count
+    }
 
 # ─────────────────────────────────────────
 # RUN SERVER
