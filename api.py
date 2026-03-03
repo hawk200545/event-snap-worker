@@ -6,7 +6,7 @@ import tempfile
 import os
 import uuid
 from dotenv import load_dotenv
-from detector import process_image, match_faces
+from detector import process_image
 from prisma import Prisma
 from bullmq import Worker
 from consumer import process_photo_job
@@ -169,15 +169,13 @@ async def upload_photo(room_id: str, file: UploadFile = File(...)):
         )
         print(f"✅ Photo saved to NeonDB: {photo.id}")
         
-        # Save embeddings to NeonDB ← REAL DB NOW
+        # Save embeddings to NeonDB via raw SQL (pgvector)
         for i, emb in enumerate(embeddings):
-            await db.faceembedding.create(
-                data={
-                    "photoId": photo.id,
-                    "roomId": room_id,
-                    "embedding": emb["embedding"],
-                    "faceIndex": i
-                }
+            vec = "[" + ",".join(str(x) for x in emb["embedding"]) + "]"
+            await db.execute_raw(
+                '''INSERT INTO "FaceEmbedding" (id, "photoId", "roomId", "faceIndex", embedding, "createdAt")
+                   VALUES ($1, $2, $3, $4, $5::vector, NOW())''',
+                str(uuid.uuid4()), photo.id, room_id, i, vec,
             )
         print(f"✅ {len(embeddings)} embeddings saved to NeonDB")
         
@@ -211,33 +209,42 @@ async def search_by_selfie(room_id: str, file: UploadFile = File(...)):
             return {"success": False, "message": "No face found in selfie"}
         
         selfie_embedding = selfie_embeddings[0]["embedding"]
-        
-        # Fetch all embeddings from NeonDB ← REAL DB NOW
-        db_embeddings = await db.faceembedding.find_many(
-            where={"roomId": room_id},
-            include={"photo": True}
+
+        # pgvector cosine search — <=> is cosine distance (0=identical, 2=opposite)
+        # similarity = 1 - distance, so threshold 0.68 → distance <= 0.32
+        vec = "[" + ",".join(str(x) for x in selfie_embedding) + "]"
+        DISTANCE_THRESHOLD = 0.40  # cosine distance ≤ 0.40 → similarity ≥ 0.60
+
+        results = await db.query_raw(
+            '''
+            SELECT
+                fe."photoId",
+                p."storageKey",
+                CAST(1 - (fe.embedding <=> $2::vector) AS FLOAT) AS similarity
+            FROM "FaceEmbedding" fe
+            JOIN "Photo" p ON p.id = fe."photoId"
+            WHERE fe."roomId" = $1
+              AND (fe.embedding <=> $2::vector) <= $3
+            ORDER BY fe.embedding <=> $2::vector
+            LIMIT 20
+            ''',
+            room_id, vec, DISTANCE_THRESHOLD,
         )
-        
-        if not db_embeddings:
-            return {"success": False, "message": "No photos in this room yet"}
-        
-        # Format for match_faces
-        stored_embeddings = [
+
+        matches = [
             {
-                "photo_id": emb.photoId,
-                "s3_url": emb.photo.storageKey,
-                "embedding": emb.embedding
+                "photo_id": r["photoId"],
+                "s3_url": r["storageKey"],
+                "similarity": round(float(r["similarity"]), 3),
             }
-            for emb in db_embeddings
+            for r in results
         ]
-        
-        # Match faces
-        matches = match_faces(selfie_embedding, stored_embeddings, threshold=0.75)
-        
+
+        print(f"✅ pgvector found {len(matches)} match(es)")
         return {
             "success": True,
             "matches_found": len(matches),
-            "photos": matches
+            "photos": matches,
         }
     
     except Exception as e:

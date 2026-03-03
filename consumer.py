@@ -1,5 +1,6 @@
 import os
 import tempfile
+import uuid
 from datetime import datetime, timezone
 
 import boto3
@@ -57,13 +58,12 @@ async def process_photo_job(job, token):
             face_thumb_key = f"rooms/{room_id}/thumbs/face_{photo_id}_{i}.jpg"
             s3.put_object(Bucket=BUCKET, Key=face_thumb_key, Body=face_bytes, ContentType="image/jpeg")
 
-            await db.faceembedding.create(data={
-                "photoId": photo_id,
-                "roomId": room_id,
-                "faceIndex": i,
-                "embedding": emb["embedding"],
-                "faceThumbKey": face_thumb_key,
-            })
+            vec = "[" + ",".join(str(x) for x in emb["embedding"]) + "]"
+            await db.execute_raw(
+                '''INSERT INTO "FaceEmbedding" (id, "photoId", "roomId", "faceIndex", embedding, "faceThumbKey", "createdAt")
+                   VALUES ($1, $2, $3, $4, $5::vector, $6, NOW())''',
+                str(uuid.uuid4()), photo_id, room_id, i, vec, face_thumb_key,
+            )
 
         os.unlink(tmp_path)
 

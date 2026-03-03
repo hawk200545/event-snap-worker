@@ -137,7 +137,7 @@ model FaceEmbedding {
   photoId      String
   roomId       String
   faceIndex    Int      @default(0)
-  embedding    Float[]
+  embedding    Unsupported("vector(512)")?
   faceThumbKey String?
   createdAt    DateTime @default(now())
 

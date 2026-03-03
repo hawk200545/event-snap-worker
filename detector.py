@@ -1,7 +1,5 @@
 import cv2
-import numpy as np
 import os
-import tempfile
 from deepface import DeepFace
 
 # ─────────────────────────────────────────
@@ -31,34 +29,6 @@ def validate_image(image_path: str):
 
 
 # ─────────────────────────────────────────
-# STEP 2 — Preprocess Image
-# ─────────────────────────────────────────
-def preprocess_image(image_path: str):
-    """
-    Resize large images to save RAM on t2.micro
-    """
-    img = cv2.imread(image_path)
-    
-    max_size = 800
-    h, w = img.shape[:2]
-    
-    if max(h, w) > max_size:
-        scale = max_size / max(h, w)
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-        img = cv2.resize(img, (new_w, new_h))
-        print(f"📐 Resized from {w}x{h} to {new_w}x{new_h}")
-    else:
-        print(f"📐 No resize needed — {w}x{h}")
-    
-    # Save processed image to temp file
-    processed_path = image_path.replace(".jpg", "_processed.jpg").replace(".jpeg", "_processed.jpeg").replace(".png", "_processed.png")
-    cv2.imwrite(processed_path, img)
-    
-    return processed_path
-
-
-# ─────────────────────────────────────────
 # STEP 3 — Extract Face Embeddings
 # ─────────────────────────────────────────
 def extract_embeddings(image_path: str):
@@ -68,14 +38,17 @@ def extract_embeddings(image_path: str):
     """
     try:
         results = DeepFace.represent(
-        img_path=image_path,
-        model_name="Facenet",
-        detector_backend="retinaface",  # keep best detector
-        enforce_detection=False
-)
-        
+            img_path=image_path,
+            model_name="ArcFace",
+            detector_backend="retinaface",
+            enforce_detection=False,
+        )
+
         embeddings = []
         for r in results:
+            # Skip low-confidence detections (retinaface provides this)
+            if r.get("face_confidence", 1.0) < 0.85:
+                continue
             embeddings.append({
                 "embedding": r["embedding"],
                 "facial_area": r["facial_area"]
@@ -105,37 +78,7 @@ def crop_face_thumbnail(image_path: str, facial_area: dict, size: int = 160) -> 
 
 
 # ─────────────────────────────────────────
-# STEP 4 — Match Faces
-# ─────────────────────────────────────────
-def cosine_similarity(a, b):
-    a = np.array(a)
-    b = np.array(b)
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-def match_faces(selfie_embedding: list, stored_embeddings: list, threshold=0.68):
-    """
-    Compare selfie against all stored embeddings
-    Return matched photos
-    """
-    matches = []
-    
-    for item in stored_embeddings:
-        similarity = cosine_similarity(selfie_embedding, item["embedding"])
-        
-        if similarity >= threshold:
-            matches.append({
-                "photo_id": item["photo_id"],
-                "s3_url": item["s3_url"],
-                "similarity": round(float(similarity), 3)
-            })
-    
-    matches.sort(key=lambda x: x["similarity"], reverse=True)
-    print(f"✅ Found {len(matches)} matching photos")
-    return matches
-
-
-# ─────────────────────────────────────────
-# STEP 5 — Full Pipeline
+# STEP 4 — Full Pipeline
 # ─────────────────────────────────────────
 def process_image(image_path: str):
     """
@@ -143,24 +86,15 @@ def process_image(image_path: str):
     Returns embeddings if successful
     """
     print(f"\n🔄 Processing: {image_path}")
-    
-    # Validate
+
     valid, message = validate_image(image_path)
     if not valid:
         print(f"❌ Validation failed: {message}")
         return []
-    
-    # Preprocess
-    processed_path = preprocess_image(image_path)
-    
-    # Extract embeddings
-    embeddings = extract_embeddings(processed_path)
-    
-    # Cleanup processed file
-    if processed_path != image_path and os.path.exists(processed_path):
-        os.remove(processed_path)
-    
-    return embeddings
+
+    # Run detection on the original file so facial_area coords
+    # stay consistent with the file consumer.py uses for cropping
+    return extract_embeddings(image_path)
 
 
 # ─────────────────────────────────────────
