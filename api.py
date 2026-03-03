@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
             "port": parsed.port or 6379,
             "username": parsed.username or "default",
             "password": parsed.password,
-            "tls": REDIS_URL.startswith("rediss://"),
+            "ssl": REDIS_URL.startswith("rediss://"),
         }
         worker = Worker("photo-processing", process_photo_job, {"connection": redis_opts})
         print("✅ BullMQ Worker started — listening on 'photo-processing'")

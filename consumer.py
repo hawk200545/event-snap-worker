@@ -4,6 +4,9 @@ from datetime import datetime, timezone
 
 import boto3
 import cv2
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from prisma import Prisma
 from detector import process_image, crop_face_thumbnail
